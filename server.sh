@@ -499,6 +499,10 @@ services:
     # Monitors containers labelled autoheal=true and restarts them when unhealthy.
     # Needs docker.sock to call the Docker API — direct mount is acceptable here
     # because autoheal runs no user-facing services and its attack surface is minimal.
+    # network_mode: none — autoheal only needs docker.sock, no network connectivity.
+    # Without this Docker Compose creates a spurious socket-proxy_default bridge
+    # which may get a subnet outside 172.16.0.0/12 and trigger the DOCKER-USER DROP rule.
+    network_mode: none
     environment:
       AUTOHEAL_CONTAINER_LABEL: autoheal
       AUTOHEAL_INTERVAL: 30        # check every 30 s
