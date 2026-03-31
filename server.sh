@@ -455,6 +455,16 @@ services:
     image: tecnativa/docker-socket-proxy:latest
     container_name: socket-proxy
     restart: unless-stopped
+    # Healthcheck: detects stale socket connections (e.g. after Docker engine updates
+    # via unattended-upgrades). With live-restore=true the container stays "Up" but
+    # HAProxy inside loses its connection to docker.sock — _ping returns 503.
+    # autoheal below detects unhealthy and restarts automatically.
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:2375/_ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:
@@ -477,6 +487,24 @@ services:
       NODES:      1   # Required by Arcane for node info
     networks:
       - socket-proxy
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      - "autoheal=true"
+
+  autoheal:
+    image: willfarrell/autoheal:latest
+    container_name: autoheal
+    restart: unless-stopped
+    # Monitors containers labelled autoheal=true and restarts them when unhealthy.
+    # Needs docker.sock to call the Docker API — direct mount is acceptable here
+    # because autoheal runs no user-facing services and its attack surface is minimal.
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: autoheal
+      AUTOHEAL_INTERVAL: 30        # check every 30 s
+      AUTOHEAL_START_PERIOD: 60    # ignore unhealthy during first 60 s after daemon start
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     security_opt:
       - no-new-privileges:true
 
@@ -522,7 +550,7 @@ services:
       - "0.0.0.0:80:80"
       - "0.0.0.0:443:443"
     volumes:
-      - ${MGMT_DIR}/traefik/letsencrypt:/letsencrypt
+      - ${MGMT_DIR}/management/traefik/letsencrypt:/letsencrypt
     networks:
       traefik-public:
         ipv4_address: 172.18.0.255
@@ -782,7 +810,7 @@ if [ "${INSTALL_TAILSCALE}" = "yes" ]; then
     # --timeout: abort rather than hang indefinitely if the control plane is unreachable.
     # --accept-routes: honour subnet routes advertised by other nodes (harmless if unused).
     # The auth key is passed via env var to avoid it appearing in 'ps' output.
-    TS_UP_ARGS="--timeout=60s"
+    TS_UP_ARGS="--authkey=${TAILSCALE_AUTH_KEY} --timeout=60s"
     [ "${TAILSCALE_EXIT_NODE}" = "yes" ] && TS_UP_ARGS="${TS_UP_ARGS} --advertise-exit-node"
     TS_AUTHKEY="${TAILSCALE_AUTH_KEY}" tailscale up ${TS_UP_ARGS}
 
