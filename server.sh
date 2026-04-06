@@ -361,6 +361,17 @@ apply_docker_user_rules() {
     iptables -I DOCKER-USER ${pos} -p tcp --dport 443 -j RETURN
   fi
   iptables -A DOCKER-USER -j DROP
+
+  # Tailscale exit node: masquerade outgoing traffic on the WAN interface so that
+  # client packets are NATted correctly when leaving the server.
+  # Only applied when TAILSCALE_EXIT_NODE=yes — no-op otherwise.
+  if [ "${TAILSCALE_EXIT_NODE}" = "yes" ]; then
+    local main_if
+    main_if="$(ip -o -4 route show default | awk '{print $5; exit}')"
+    iptables -t nat -C POSTROUTING -o "${main_if}" -j MASQUERADE 2>/dev/null || \
+      iptables -t nat -A POSTROUTING -o "${main_if}" -j MASQUERADE
+    echo "[*] Tailscale exit node: MASQUERADE added for outbound interface ${main_if}"
+  fi
 }
 
 apply_docker_user_rules
@@ -386,6 +397,15 @@ RULE_POS=5
 $([ "${ALLOW_HTTP}"  = "yes" ] && echo 'iptables -I DOCKER-USER 5 -p tcp --dport 80  -j RETURN; RULE_POS=6')
 $([ "${ALLOW_HTTPS}" = "yes" ] && echo 'iptables -I DOCKER-USER ${RULE_POS} -p tcp --dport 443 -j RETURN')
 iptables -A DOCKER-USER -j DROP
+
+$([ "${TAILSCALE_EXIT_NODE}" = "yes" ] && cat <<'MASQ'
+# Tailscale exit node: NAT outgoing traffic so client packets are masqueraded
+# correctly on the WAN interface. Rule is idempotent (-C checks before -A).
+MAIN_IF="$(ip -o -4 route show default | awk '{print $5; exit}')"
+iptables -t nat -C POSTROUTING -o "${MAIN_IF}" -j MASQUERADE 2>/dev/null || \
+  iptables -t nat -A POSTROUTING -o "${MAIN_IF}" -j MASQUERADE
+MASQ
+)
 RULES_EOF
 
 chmod 700 /usr/local/sbin/apply-docker-user-rules.sh
@@ -976,6 +996,7 @@ SUMMARY:
     fi
   )
 $([ "${TAILSCALE_EXIT_NODE}" = "yes" ] && echo "  Exit node     Advertised — approve in Tailscale admin console (Machines → Edit route settings)")
+$([ "${TAILSCALE_EXIT_NODE}" = "yes" ] && echo "  NAT/MASQ      POSTROUTING MASQUERADE active on WAN interface (persisted via systemd)")
 $([ "${SSH_VIA_TAILSCALE}" = "yes" ] && echo "  SSH access    Tailscale-only (tailscale0) — public SSH is BLOCKED by UFW")
 $([ "${SSH_VIA_TAILSCALE}" != "yes" ] && echo "  SSH access    Public internet (rate-limited)")
   Auto-updates  Security + stable + Docker; auto-reboot at 03:00 if needed
