@@ -346,35 +346,11 @@ systemctl restart docker
 
 echo "[*] Hardening Docker iptables via DOCKER-USER chain..."
 
-# Docker manipulates iptables directly, bypassing UFW entirely.
-# The DOCKER-USER chain is evaluated before Docker's own chains and lets us
-# enforce restrictions on all traffic reaching Docker-exposed ports.
-#
-# Rules (evaluated top-down):
-#   1. Allow loopback (lo)
-#   2. Allow established/related return traffic (outbound from containers)
-#   3. Allow public HTTP  (port 80)  if ALLOW_HTTP=yes  — Traefik ingress
-#   4. Allow public HTTPS (port 443) if ALLOW_HTTPS=yes — Traefik ingress
-#   5. DROP everything else
-#
-# Traefik:   receives public traffic on 80/443 (allowed above); all other container
-#            traffic flows on internal user-defined networks (never hits this chain).
-# Arcane: NOT published on a public port — access via SSH tunnel (see NEXT STEPS).
-# App+DB:    communicate on a shared user-defined network — traffic never leaves the Docker
-#            network bridge so the DOCKER-USER chain is not involved at all.
-
 apply_docker_user_rules() {
   iptables -F DOCKER-USER 2>/dev/null || true
   iptables -I DOCKER-USER 1 -i lo -j RETURN
   iptables -I DOCKER-USER 2 -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
-  # Allow container-to-container traffic on Docker bridge networks.
-  # Docker's own ACCEPT rules for internal networks are in the DOCKER chain, which
-  # comes AFTER DOCKER-USER — without this, our DROP at the end blocks inter-container
-  # communication (e.g. Traefik → socket-proxy).
   iptables -I DOCKER-USER 3 -s 172.16.0.0/12 -d 172.16.0.0/12 -j RETURN
-  # Allow outbound traffic from containers to the internet (e.g. Traefik → Let's Encrypt,
-  # containers pulling data from external APIs). Without this the DROP at the end
-  # blocks all container-initiated connections to non-Docker destinations.
   iptables -I DOCKER-USER 4 -s 172.16.0.0/12 ! -d 172.16.0.0/12 -j RETURN
   local pos=5
   if [ "${ALLOW_HTTP}" = "yes" ]; then
@@ -389,12 +365,34 @@ apply_docker_user_rules() {
 
 apply_docker_user_rules
 
-# Persist rules via a systemd service — iptables-persistent conflicts with ufw on Debian 13.
-# The service saves current rules on stop and restores them on start (after Docker brings
-# up its chains), ordering it after docker.service ensures DOCKER-USER already exists.
-cat >/etc/systemd/system/docker-iptables-restore.service <<EOF
+# Persist als eigenständiges Script — nur DOCKER-USER Chain, nie alle Chains.
+# Frühere Lösung (iptables-save/restore) speicherte UFW+Tailscale+Docker Regeln
+# und stellte sie beim Reboot wieder her, woraufhin alle Tools ihre Regeln
+# erneut einfügten → exponentielle Akkumulation über mehrere Neustarts.
+cat >/usr/local/sbin/apply-docker-user-rules.sh <<RULES_EOF
+#!/bin/bash
+# Warte bis DOCKER-USER Chain existiert (wird von dockerd erstellt)
+for i in \$(seq 1 30); do
+  iptables -L DOCKER-USER &>/dev/null && break
+  sleep 1
+done
+
+iptables -F DOCKER-USER
+iptables -I DOCKER-USER 1 -i lo -j RETURN
+iptables -I DOCKER-USER 2 -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+iptables -I DOCKER-USER 3 -s 172.16.0.0/12 -d 172.16.0.0/12 -j RETURN
+iptables -I DOCKER-USER 4 -s 172.16.0.0/12 ! -d 172.16.0.0/12 -j RETURN
+RULE_POS=5
+$([ "${ALLOW_HTTP}"  = "yes" ] && echo 'iptables -I DOCKER-USER 5 -p tcp --dport 80  -j RETURN; RULE_POS=6')
+$([ "${ALLOW_HTTPS}" = "yes" ] && echo 'iptables -I DOCKER-USER ${RULE_POS} -p tcp --dport 443 -j RETURN')
+iptables -A DOCKER-USER -j DROP
+RULES_EOF
+
+chmod 700 /usr/local/sbin/apply-docker-user-rules.sh
+
+cat >/etc/systemd/system/docker-iptables-restore.service <<'EOF'
 [Unit]
-Description=Restore DOCKER-USER iptables rules
+Description=Apply DOCKER-USER iptables rules
 After=docker.service
 Requires=docker.service
 PartOf=docker.service
@@ -402,16 +400,11 @@ PartOf=docker.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/sbin/iptables-restore --noflush /etc/docker-iptables.rules
-ExecStop=/bin/sh -c 'iptables-save > /etc/docker-iptables.rules'
+ExecStart=/usr/local/sbin/apply-docker-user-rules.sh
 
 [Install]
 WantedBy=multi-user.target
 EOF
-
-# Save the current rules for the service to restore on next boot
-iptables-save > /etc/docker-iptables.rules
-chmod 600 /etc/docker-iptables.rules
 
 systemctl daemon-reload
 systemctl enable docker-iptables-restore.service
