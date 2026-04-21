@@ -122,6 +122,26 @@ apt-get install -y \
 # and they cannot coexist. DOCKER-USER rules are persisted via a systemd service instead.
 
 ########################
+# Block iptables-persistent (apt pinning)
+########################
+
+echo "[*] Blocking iptables-persistent via apt pinning..."
+
+# iptables-persistent snapshots the ENTIRE iptables state (including dynamic Docker
+# chains, UFW rules, Tailscale chains) and replays them on every boot. Docker then
+# adds its own chains on top → duplicated/corrupted rules → containers unreachable.
+# DOCKER-USER rules are persisted via a dedicated systemd service instead.
+cat >/etc/apt/preferences.d/no-iptables-persistent <<'EOF'
+Package: iptables-persistent
+Pin: release *
+Pin-Priority: -1
+
+Package: netfilter-persistent
+Pin: release *
+Pin-Priority: -1
+EOF
+
+########################
 # QEMU Guest Agent
 ########################
 
@@ -319,7 +339,8 @@ cat >/etc/docker/daemon.json <<'EOF'
     "max-file": "3"
   },
   "live-restore": true,
-  "iptables": true
+  "iptables": true,
+  "userland-proxy": false
 }
 EOF
 
@@ -336,6 +357,14 @@ EOF
 #                       ports: ["0.0.0.0:80:80", "0.0.0.0:443:443"]
 #                     Internal services (Arcane, DBs) must NOT use 0.0.0.0 — keep them on
 #                     user-defined networks and route through Traefik.
+#
+# "userland-proxy": false — disables Docker's userland TCP proxy (docker-proxy process)
+#                     and uses pure iptables DNAT for port forwarding instead.
+#                     CRITICAL for Traefik ipAllowList middleware: docker-proxy replaces
+#                     the real client source IP with the Docker bridge gateway IP (e.g.
+#                     172.19.0.1), making IP-based access control impossible. With
+#                     userland-proxy=false, the original client IP (including Tailscale
+#                     100.64.x.x addresses) is preserved through to the container.
 
 systemctl daemon-reload
 systemctl restart docker
@@ -443,6 +472,29 @@ echo "[*] Creating Docker networks..."
 
 docker network create --subnet 172.18.0.0/16 traefik-public 2>/dev/null || echo "  traefik-public already exists"
 docker network create socket-proxy   2>/dev/null || echo "  socket-proxy already exists"
+
+########################
+# Restart socket-proxy after Docker daemon restarts
+########################
+
+echo "[*] Configuring socket-proxy auto-restart after Docker daemon restarts..."
+
+# When the Docker daemon restarts (e.g. after an unattended-upgrade of docker-ce),
+# /var/run/docker.sock is recreated with a new inode. The socket-proxy container's
+# bind mount still points to the old (now deleted) inode — HAProxy inside returns 503
+# on every request, even though the container shows as "Up" (live-restore=true keeps
+# it running). This systemd drop-in restarts socket-proxy after every dockerd start
+# so it picks up the fresh socket. The autoheal container provides a secondary safety
+# net via healthcheck, but this drop-in is faster and more reliable.
+
+mkdir -p /etc/systemd/system/docker.service.d
+
+cat >/etc/systemd/system/docker.service.d/restart-socket-proxy.conf <<'EOF'
+[Service]
+ExecStartPost=/usr/bin/docker restart socket-proxy
+EOF
+
+systemctl daemon-reload
 
 ########################
 # Docker socket proxy + Traefik + Arcane compose files
@@ -923,9 +975,23 @@ Unattended-Upgrade::Origins-Pattern {
     "origin=Debian,codename=${distro_codename}-security,label=Debian-Security";
     // Debian stable updates (bug fixes with security implications)
     "origin=Debian,codename=${distro_codename}-updates";
-    // Docker CE — packages from the Docker repo are not covered by Debian origins.
-    // Remove this line if you want to manage Docker upgrades manually.
-    "origin=Docker";
+};
+
+// Docker CE packages are excluded from unattended-upgrades (see Package-Blacklist below).
+// Docker daemon restarts triggered by package updates corrupt iptables chains — Docker
+// rebuilds its NAT/filter/raw rules on restart, but stale rules from the previous daemon
+// instance accumulate, causing duplicated DOCKER-USER, FORWARD, and PREROUTING chains.
+// This makes containers unreachable from the public internet. Update Docker manually:
+//   apt update && apt upgrade docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-buildx-plugin
+//   systemctl restart docker
+
+Unattended-Upgrade::Package-Blacklist {
+    "docker-ce";
+    "docker-ce-cli";
+    "docker-ce-rootless-extras";
+    "containerd.io";
+    "docker-compose-plugin";
+    "docker-buildx-plugin";
 };
 
 // Remove unused automatically-installed packages after upgrades
@@ -970,10 +1036,9 @@ Setup complete on Debian 13 Trixie (Hetzner Cloud).
 SUMMARY:
   System        Updated with DEBIAN_FRONTEND=noninteractive
   sysctl        /etc/sysctl.d/99-hardening.conf (SYN cookies, rp_filter, redirect blocks, etc.)
-  Docker CE     icc=true, no-new-privileges, ip=127.0.0.1
+  Docker CE     icc=true, no-new-privileges, ip=127.0.0.1, userland-proxy=false
   iptables      DOCKER-USER: HTTP(${ALLOW_HTTP})/HTTPS(${ALLOW_HTTPS}) public; else DROP
                 Persisted via systemd (docker-iptables-restore.service)
-                Rules saved to /etc/docker-iptables.rules
   Networks      traefik-public, socket-proxy (pre-created)
   Templates     ${MGMT_DIR}/socket-proxy/docker-compose.yml       ← start this first
                 ${MGMT_DIR}/traefik/docker-compose.yml      ← Traefik v3
@@ -999,7 +1064,8 @@ $([ "${TAILSCALE_EXIT_NODE}" = "yes" ] && echo "  Exit node     Advertised — a
 $([ "${TAILSCALE_EXIT_NODE}" = "yes" ] && echo "  NAT/MASQ      POSTROUTING MASQUERADE active on WAN interface (persisted via systemd)")
 $([ "${SSH_VIA_TAILSCALE}" = "yes" ] && echo "  SSH access    Tailscale-only (tailscale0) — public SSH is BLOCKED by UFW")
 $([ "${SSH_VIA_TAILSCALE}" != "yes" ] && echo "  SSH access    Public internet (rate-limited)")
-  Auto-updates  Security + stable + Docker; auto-reboot at 03:00 if needed
+  Auto-updates  Security + stable (Docker excluded — update manually)
+  Blocked pkgs  iptables-persistent, netfilter-persistent (apt pin -1)
 
 SSH ACCESS:
 $(if [ "${SSH_VIA_TAILSCALE}" = "yes" ]; then
@@ -1041,6 +1107,12 @@ KEY RULES:
   • Never mount /var/run/docker.sock into Traefik or Arcane directly — only into socket-proxy
   • DB containers: backend network only — never traefik-public, never a published port
   • Network isolation is enforced by attaching each container only to the networks it needs
+
+DOCKER UPDATES:
+  Docker CE is excluded from unattended-upgrades to prevent iptables corruption.
+  Update manually when ready:
+    apt update && apt upgrade docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-buildx-plugin
+    systemctl restart docker
 
 NEXT STEPS:
   1. Verify your SSH public key is in authorized_keys — test login NOW.
