@@ -150,6 +150,18 @@ systemctl enable qemu-guest-agent
 systemctl start qemu-guest-agent
 
 ########################
+# Bridge netfilter module — load before sysctl
+########################
+
+# br_netfilter must be loaded before systemd-sysctl applies settings, otherwise
+# the bridge-nf-call sysctls in 99-hardening.conf fail with "No such file or
+# directory" (the /proc/sys/net/bridge/* sysfs files only exist when the module
+# is loaded). Docker would later load br_netfilter on demand, but by then the
+# sysctl values would already have been silently skipped.
+echo 'br_netfilter' > /etc/modules-load.d/br_netfilter.conf
+modprobe br_netfilter
+
+########################
 # Kernel / sysctl hardening
 ########################
 
@@ -198,6 +210,17 @@ kernel.yama.ptrace_scope = 1
 
 # Disable core dumps for setuid binaries
 fs.suid_dumpable = 0
+
+# Container-to-container Bridge traffic must NOT traverse iptables FORWARD.
+# Without this, the DOCKER-USER chain's final DROP rule kills inter-container
+# ICMP/TCP between containers on the same bridge (e.g. Traefik -> socket-proxy).
+# Bridge isolation is enforced by Docker's network topology (separate user-defined
+# networks per stack), not by iptables on the bridge itself.
+# NOTE: This is belt-and-suspenders — Docker 29.x re-sets bridge-nf-call-iptables=1
+# on every daemon start, so the actual fix lives in a docker.service drop-in
+# (see 'Disable bridge netfilter on Docker startup' block below).
+net.bridge.bridge-nf-call-iptables = 0
+net.bridge.bridge-nf-call-ip6tables = 0
 
 # NOTE: net.ipv4.ip_forward is intentionally left at its default (1) — required by Docker
 EOF
@@ -366,6 +389,30 @@ EOF
 #                     userland-proxy=false, the original client IP (including Tailscale
 #                     100.64.x.x addresses) is preserved through to the container.
 
+# Docker 29.x sets net.bridge.bridge-nf-call-iptables=1 on daemon startup, overriding
+# anything in /etc/sysctl.d/. This is intentional Docker behaviour to support
+# host-IP:mapped-port access between containers when userland-proxy=false (see PR
+# https://github.com/moby/moby/pull/48685). Side effect: inter-container Bridge
+# traffic gets routed through iptables FORWARD, where the DOCKER-USER chain's final
+# DROP rule kills it (e.g. Traefik -> socket-proxy ping fails 100% after reboot).
+#
+# Trade-off accepted: we lose the ability for container A on bridge X to reach
+# container B (also on bridge X) via the host's mapped port. We don't use that
+# pattern — inter-container traffic goes via internal Docker networks by service
+# name; external traffic comes through Traefik. userland-proxy=false stays enabled
+# so Traefik IP allowlists keep seeing real client IPs (e.g. Tailscale 100.64/10).
+#
+# The drop-in below resets the values *after* dockerd's own bridge setup runs,
+# which is the only reliable place to win this race.
+
+mkdir -p /etc/systemd/system/docker.service.d
+
+cat >/etc/systemd/system/docker.service.d/disable-bridge-netfilter.conf <<'EOF'
+[Service]
+ExecStartPost=/sbin/sysctl -w net.bridge.bridge-nf-call-iptables=0
+ExecStartPost=/sbin/sysctl -w net.bridge.bridge-nf-call-ip6tables=0
+EOF
+
 systemctl daemon-reload
 systemctl restart docker
 
@@ -375,69 +422,64 @@ systemctl restart docker
 
 echo "[*] Hardening Docker iptables via DOCKER-USER chain..."
 
-apply_docker_user_rules() {
-  iptables -F DOCKER-USER 2>/dev/null || true
-  iptables -I DOCKER-USER 1 -i lo -j RETURN
-  iptables -I DOCKER-USER 2 -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
-  iptables -I DOCKER-USER 3 -s 172.16.0.0/12 -d 172.16.0.0/12 -j RETURN
-  iptables -I DOCKER-USER 4 -s 172.16.0.0/12 ! -d 172.16.0.0/12 -j RETURN
-  local pos=5
-  if [ "${ALLOW_HTTP}" = "yes" ]; then
-    iptables -I DOCKER-USER ${pos} -p tcp --dport 80 -j RETURN
-    pos=$((pos + 1))
-  fi
-  if [ "${ALLOW_HTTPS}" = "yes" ]; then
-    iptables -I DOCKER-USER ${pos} -p tcp --dport 443 -j RETURN
-  fi
-  iptables -A DOCKER-USER -j DROP
-
-  # Tailscale exit node: masquerade outgoing traffic on the WAN interface so that
-  # client packets are NATted correctly when leaving the server.
-  # Only applied when TAILSCALE_EXIT_NODE=yes — no-op otherwise.
-  if [ "${TAILSCALE_EXIT_NODE}" = "yes" ]; then
-    local main_if
-    main_if="$(ip -o -4 route show default | awk '{print $5; exit}')"
-    iptables -t nat -C POSTROUTING -o "${main_if}" -j MASQUERADE 2>/dev/null || \
-      iptables -t nat -A POSTROUTING -o "${main_if}" -j MASQUERADE
-    echo "[*] Tailscale exit node: MASQUERADE added for outbound interface ${main_if}"
-  fi
-}
-
-apply_docker_user_rules
-
-# Persist als eigenständiges Script — nur DOCKER-USER Chain, nie alle Chains.
-# Frühere Lösung (iptables-save/restore) speicherte UFW+Tailscale+Docker Regeln
-# und stellte sie beim Reboot wieder her, woraufhin alle Tools ihre Regeln
-# erneut einfügten → exponentielle Akkumulation über mehrere Neustarts.
-cat >/usr/local/sbin/apply-docker-user-rules.sh <<RULES_EOF
+# Persist as a standalone script — only DOCKER-USER chain, never all chains.
+# Earlier approach (iptables-save/restore) snapshotted UFW + Tailscale + Docker
+# rules together and replayed them on boot. Then all those tools re-inserted
+# their own rules on top → exponential accumulation across reboots.
+#
+# IMPORTANT: this script is fully static (single-quoted heredoc). Conditional
+# rules based on shell vars at install time were unreliable — an earlier version
+# silently dropped the 172.16/12 RETURN rules due to nested expansion inside the
+# heredoc, breaking all container outbound traffic after every reboot.
+# If you need to disable HTTP/HTTPS, edit /usr/local/sbin/apply-docker-user-rules.sh
+# directly after the bootstrap (ALLOW_HTTP/ALLOW_HTTPS env vars only gate UFW
+# now, not the DOCKER-USER chain).
+cat >/usr/local/sbin/apply-docker-user-rules.sh <<'RULES_EOF'
 #!/bin/bash
-# Warte bis DOCKER-USER Chain existiert (wird von dockerd erstellt)
-for i in \$(seq 1 30); do
-  iptables -L DOCKER-USER &>/dev/null && break
+set -euo pipefail
+
+# Wait for DOCKER-USER chain to exist (Docker creates it on startup)
+for i in {1..30}; do
+  iptables -L DOCKER-USER -n >/dev/null 2>&1 && break
   sleep 1
 done
 
 iptables -F DOCKER-USER
-iptables -I DOCKER-USER 1 -i lo -j RETURN
-iptables -I DOCKER-USER 2 -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
-iptables -I DOCKER-USER 3 -s 172.16.0.0/12 -d 172.16.0.0/12 -j RETURN
-iptables -I DOCKER-USER 4 -s 172.16.0.0/12 ! -d 172.16.0.0/12 -j RETURN
-RULE_POS=5
-$([ "${ALLOW_HTTP}"  = "yes" ] && echo 'iptables -I DOCKER-USER 5 -p tcp --dport 80  -j RETURN; RULE_POS=6')
-$([ "${ALLOW_HTTPS}" = "yes" ] && echo 'iptables -I DOCKER-USER ${RULE_POS} -p tcp --dport 443 -j RETURN')
+
+# Allow loopback and established connections
+iptables -A DOCKER-USER -i lo -j RETURN
+iptables -A DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+
+# Allow Tailscale source range (Exit Node clients reaching containers)
+iptables -A DOCKER-USER -s 100.64.0.0/10 -j RETURN
+
+# Allow all container outbound traffic (covers container-to-container AND
+# container-to-external; Docker uses the 172.16.0.0/12 range for bridges).
+iptables -A DOCKER-USER -s 172.16.0.0/12 -j RETURN
+
+# Allow inbound HTTP/HTTPS to containers
+iptables -A DOCKER-USER -p tcp --dport 80 -j RETURN
+iptables -A DOCKER-USER -p tcp --dport 443 -j RETURN
+
+# Drop everything else
 iptables -A DOCKER-USER -j DROP
 
-$([ "${TAILSCALE_EXIT_NODE}" = "yes" ] && cat <<'MASQ'
-# Tailscale exit node: NAT outgoing traffic so client packets are masqueraded
-# correctly on the WAN interface. Rule is idempotent (-C checks before -A).
+# Tailscale Exit Node MASQUERADE — only takes effect when this server is an
+# exit node, otherwise the rule is harmless (no Tailscale traffic to NAT).
+# Idempotent: -C checks for the rule before -A appends.
 MAIN_IF="$(ip -o -4 route show default | awk '{print $5; exit}')"
-iptables -t nat -C POSTROUTING -o "${MAIN_IF}" -j MASQUERADE 2>/dev/null || \
-  iptables -t nat -A POSTROUTING -o "${MAIN_IF}" -j MASQUERADE
-MASQ
-)
+if [ -n "${MAIN_IF}" ]; then
+  iptables -t nat -C POSTROUTING -o "${MAIN_IF}" -j MASQUERADE 2>/dev/null || \
+    iptables -t nat -A POSTROUTING -o "${MAIN_IF}" -j MASQUERADE
+fi
+
+logger -t docker-user-rules "DOCKER-USER rules applied"
 RULES_EOF
 
 chmod 700 /usr/local/sbin/apply-docker-user-rules.sh
+
+# Apply the rules now (single source of truth — the same script that runs on every reboot)
+/usr/local/sbin/apply-docker-user-rules.sh
 
 cat >/etc/systemd/system/docker-iptables-restore.service <<'EOF'
 [Unit]
@@ -459,42 +501,34 @@ systemctl daemon-reload
 systemctl enable docker-iptables-restore.service
 
 ########################
-# Docker networks for Traefik / Arcane stack
-########################
-
-echo "[*] Creating Docker networks..."
-
-# traefik-public  — shared network between Traefik and any container it should route to.
-#                   Every publicly reachable service must be attached to this network.
-# socket-proxy    — isolated network between the Docker socket proxy and its consumers
-#                   (Traefik, Arcane). The real docker.sock is NEVER mounted directly
-#                   into Traefik or Arcane — only into the socket proxy.
-
-docker network create --subnet 172.18.0.0/16 traefik-public 2>/dev/null || echo "  traefik-public already exists"
-docker network create socket-proxy   2>/dev/null || echo "  socket-proxy already exists"
-
-########################
-# Restart socket-proxy after Docker daemon restarts
+# Restart socket-proxies after Docker daemon restarts
 ########################
 
 echo "[*] Configuring socket-proxy auto-restart after Docker daemon restarts..."
 
 # When the Docker daemon restarts (e.g. after an unattended-upgrade of docker-ce),
-# /var/run/docker.sock is recreated with a new inode. The socket-proxy container's
-# bind mount still points to the old (now deleted) inode — HAProxy inside returns 503
-# on every request, even though the container shows as "Up" (live-restore=true keeps
-# it running). This systemd drop-in restarts socket-proxy after every dockerd start
-# so it picks up the fresh socket. The autoheal container provides a secondary safety
-# net via healthcheck, but this drop-in is faster and more reliable.
+# /var/run/docker.sock is recreated with a new inode. The socket-proxy bind mount
+# still points to the old (now deleted) inode — HAProxy inside returns 503 on every
+# request, even though the container shows as "Up" (live-restore=true keeps it
+# running). This drop-in restarts both proxies after every dockerd start so they
+# pick up the fresh socket.
+#
+# `-` prefix on ExecStartPost tells systemd to ignore failures: on first boot (before
+# `docker compose up` has ever run) neither container exists, and we don't want
+# docker.service to be marked failed for that. The autoheal container provides a
+# secondary safety net via healthchecks.
 
 mkdir -p /etc/systemd/system/docker.service.d
 
 cat >/etc/systemd/system/docker.service.d/restart-socket-proxy.conf <<'EOF'
 [Service]
-ExecStartPost=/usr/bin/docker restart socket-proxy
+ExecStartPost=-/usr/bin/docker restart socket-proxy-traefik socket-proxy-mgmt
 EOF
 
 systemctl daemon-reload
+
+# Note: Docker networks (traefik-public, socket-proxy-traefik, socket-proxy-mgmt)
+# are created by the compose files themselves on first `docker compose up`.
 
 ########################
 # Docker socket proxy + Traefik + Arcane compose files
@@ -509,21 +543,39 @@ echo "[*] Writing Traefik / Arcane compose templates..."
 # exposes only the specific API endpoints each service actually needs, over a private
 # network. The real socket never leaves the proxy container.
 
-mkdir -p "${MGMT_DIR}/traefik" "${MGMT_DIR}/arcane" "${MGMT_DIR}/socket-proxy"
+mkdir -p "${MGMT_DIR}/traefik/dynamic" "${MGMT_DIR}/arcane" "${MGMT_DIR}/socket-proxy"
 
-# ── Socket proxy ──────────────────────────────────────────────────────────────
+# ── Socket proxies (split: read-only for Traefik, full for management UIs) ────
+#
+# Two socket-proxy instances:
+#  - socket-proxy-traefik: minimal API surface (read-only). Traefik talks to this.
+#                          Traefik is exposed to the public internet — limiting its
+#                          Docker API access reduces blast radius if it gets compromised.
+#  - socket-proxy-mgmt:    full API surface (POST/DELETE/EXEC/BUILD/SYSTEM/...).
+#                          Used by Arcane and Code Server, which need to manage
+#                          containers, exec into them, and build images. Both are
+#                          accessible only via Tailscale (Traefik IPAllowList) so the
+#                          attack surface is restricted to the tailnet.
+#
+# Even with the split, socket-proxy-mgmt is effectively root-equivalent on the host —
+# the security boundary for Arcane/Code-Server is the Tailscale-only access policy,
+# not the proxy itself.
+
 cat >"${MGMT_DIR}/socket-proxy/docker-compose.yml" <<'EOF'
-# Socket proxy — start this before Traefik and Arcane
+# Socket proxies — start this stack before Traefik / Arcane / Code Server.
+# Creates the two private networks (socket-proxy-traefik, socket-proxy-mgmt)
+# that the consumer stacks reference as external.
 
 services:
-  socket-proxy:
+  socket-proxy-traefik:
     image: tecnativa/docker-socket-proxy:latest
-    container_name: socket-proxy
+    container_name: socket-proxy-traefik
     restart: unless-stopped
     # Healthcheck: detects stale socket connections (e.g. after Docker engine updates
     # via unattended-upgrades). With live-restore=true the container stays "Up" but
     # HAProxy inside loses its connection to docker.sock — _ping returns 503.
-    # autoheal below detects unhealthy and restarts automatically.
+    # autoheal below detects unhealthy and restarts automatically; a systemd drop-in
+    # on docker.service additionally restarts both proxies on every dockerd start.
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:2375/_ping"]
       interval: 30s
@@ -533,8 +585,38 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:
-      # Traefik needs: CONTAINERS, NETWORKS, SERVICES, TASKS, VERSION, INFO, PING
-      # Arcane needs the above + IMAGES, VOLUMES, EXEC, BUILD, SYSTEM, NODES, POST, DELETE
+      # Strictly read-only API surface — only what Traefik's docker provider needs.
+      # NO POST, DELETE, EXEC, BUILD — Traefik must NEVER be able to mutate Docker.
+      CONTAINERS: 1
+      NETWORKS:   1
+      SERVICES:   1
+      TASKS:      1
+      INFO:       1
+      VERSION:    1
+      PING:       1
+    networks:
+      - socket-proxy-traefik
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      - "autoheal=true"
+
+  socket-proxy-mgmt:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: socket-proxy-mgmt
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:2375/_ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      # Full API surface — required by Arcane (container management UI) and Code
+      # Server (in-IDE Docker workflows: exec, build, restart). Effectively
+      # root-equivalent. Mitigated by Tailscale-only access at the Traefik layer.
       CONTAINERS: 1
       NETWORKS:   1
       SERVICES:   1
@@ -546,12 +628,12 @@ services:
       PING:       1
       POST:       1
       DELETE:     1
-      EXEC:       1   # Required by Arcane for container exec / web terminal
-      BUILD:      1   # Required by Arcane for image building
-      SYSTEM:     1   # Required by Arcane for system-level API calls
-      NODES:      1   # Required by Arcane for node info
+      EXEC:       1
+      BUILD:      1
+      SYSTEM:     1
+      NODES:      1
     networks:
-      - socket-proxy
+      - socket-proxy-mgmt
     security_opt:
       - no-new-privileges:true
     labels:
@@ -565,8 +647,8 @@ services:
     # Needs docker.sock to call the Docker API — direct mount is acceptable here
     # because autoheal runs no user-facing services and its attack surface is minimal.
     # network_mode: none — autoheal only needs docker.sock, no network connectivity.
-    # Without this Docker Compose creates a spurious socket-proxy_default bridge
-    # which may get a subnet outside 172.16.0.0/12 and trigger the DOCKER-USER DROP rule.
+    # Without this Docker Compose creates a spurious default bridge which may get a
+    # subnet outside 172.16.0.0/12 and trigger the DOCKER-USER DROP rule.
     network_mode: none
     environment:
       AUTOHEAL_CONTAINER_LABEL: autoheal
@@ -578,19 +660,26 @@ services:
       - no-new-privileges:true
 
 networks:
-  socket-proxy:
-    external: true
+  # Networks owned by this stack. Other stacks reference them as external.
+  socket-proxy-traefik:
+    name: socket-proxy-traefik
+  socket-proxy-mgmt:
+    name: socket-proxy-mgmt
 EOF
 
 # ── Traefik ───────────────────────────────────────────────────────────────────
-cat >"${MGMT_DIR}/traefik/docker-compose.yml" <<'EOF'
+# Unquoted heredoc — ${MGMT_DIR} is substituted at script-write time so the
+# resulting compose file has absolute paths and is self-contained (no env vars
+# required at `docker compose up` time).
+cat >"${MGMT_DIR}/traefik/docker-compose.yml" <<EOF
 # Traefik reverse proxy
 # Prerequisites:
 #   1. socket-proxy stack running (cd ~/management/socket-proxy && docker compose up -d)
 #   2. Set TRAEFIK_ACME_EMAIL below
 #   3. Replace YOURDOMAIN with your actual domain
-#   4. Generate dashboard password: echo $(htpasswd -nB admin) | sed -e 's/\$/\$\$/g'
-#   5. cd ~/management/traefik && docker compose up -d
+#   4. cd ~/management/traefik && docker compose up -d
+#
+# Networks: this stack owns the traefik-public network and creates it on first up.
 
 services:
   traefik:
@@ -601,9 +690,16 @@ services:
       - "--api.dashboard=false"
       - "--providers.docker=true"
       - "--providers.docker.exposedbydefault=false"
-      # Point to socket proxy — never mount docker.sock directly
-      - "--providers.docker.endpoint=tcp://socket-proxy:2375"
+      # Point to read-only socket proxy — never mount docker.sock directly.
+      # socket-proxy-traefik exposes only GET endpoints (CONTAINERS, NETWORKS, ...);
+      # if Traefik is compromised it cannot start/stop/exec into containers.
+      - "--providers.docker.endpoint=tcp://socket-proxy-traefik:2375"
       - "--providers.docker.network=traefik-public"
+      # File provider for shared middlewares (e.g. tailscale-only) — referenced
+      # from any container's labels as <name>@file. Watching means edits take
+      # effect without a Traefik restart.
+      - "--providers.file.directory=/dynamic"
+      - "--providers.file.watch=true"
       - "--entrypoints.web.address=:80"
       - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
       - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
@@ -619,22 +715,46 @@ services:
       - "0.0.0.0:80:80"
       - "0.0.0.0:443:443"
     volumes:
-      - ${MGMT_DIR}/management/traefik/letsencrypt:/letsencrypt
+      - ${MGMT_DIR}/traefik/letsencrypt:/letsencrypt
+      - ${MGMT_DIR}/traefik/dynamic:/dynamic:ro
     networks:
       traefik-public:
-        ipv4_address: 172.18.0.255
-      socket-proxy:
+        ipv4_address: 172.18.0.254
+      socket-proxy-traefik:
     security_opt:
       - no-new-privileges:true
 
 networks:
+  # Owned by this stack: created on first compose up if it doesn't exist.
   traefik-public:
-    external: true
+    name: traefik-public
     ipam:
       config:
         - subnet: 172.18.0.0/16
-  socket-proxy:
+  # Owned by the socket-proxy stack — must be up first.
+  socket-proxy-traefik:
+    name: socket-proxy-traefik
     external: true
+EOF
+
+# ── Traefik dynamic config: shared middlewares ───────────────────────────────
+# File-provider config — picked up automatically because Traefik watches /dynamic.
+# Add new shared middlewares here and reference them from any container as
+# <name>@file (e.g. tailscale-only@file).
+cat >"${MGMT_DIR}/traefik/dynamic/middlewares.yml" <<'EOF'
+http:
+  middlewares:
+    # Tailscale-only access gate.
+    # 100.64.0.0/10        → Tailscale CGNAT range (IPv4)
+    # fd7a:115c:a1e0::/48  → Tailscale ULA prefix  (IPv6)
+    # Public clients hitting a router with this middleware get HTTP 403.
+    # Relies on userland-proxy=false in daemon.json so the real client IP
+    # makes it to Traefik.
+    tailscale-only:
+      ipAllowList:
+        sourceRange:
+          - "100.64.0.0/10"
+          - "fd7a:115c:a1e0::/48"
 EOF
 
 # ── Arcane ────────────────────────────────────────────────────────────────────
@@ -665,12 +785,18 @@ cat >"${MGMT_DIR}/arcane/docker-compose.yml" <<EOF
 #   3. Replace YOURDOMAIN below (in APP_URL and the Traefik label)
 #   4. cd ~/management/arcane && docker compose up -d
 #
-# Access options:
-#   A) Via Traefik (HTTPS, DNS required):
-#      Set arcane.YOURDOMAIN in DNS → Traefik routes it automatically.
-#   B) Via SSH tunnel (no DNS needed — recommended for admin access):
-#      ssh -L 3552:localhost:3552 user@YOUR_SERVER_IP
-#      Then open: http://localhost:3552
+# Access (Tailscale-only):
+#   Arcane is exposed via Traefik with an IPAllowList middleware that restricts
+#   access to the Tailscale CGNAT range (100.64.0.0/10) and Tailscale ULA range
+#   (fd7a:115c:a1e0::/48). Public clients get HTTP 403.
+#   This relies on userland-proxy=false in daemon.json so the real client IP
+#   reaches Traefik intact.
+#
+#   Set arcane.YOURDOMAIN in DNS → Traefik routes it. Connect via Tailscale.
+#
+# Fallback access (no DNS / Tailscale not yet up): SSH tunnel
+#   ssh -L 3552:localhost:3552 user@YOUR_SERVER_IP
+#   Then open: http://localhost:3552
 #
 # Default login: arcane / arcane-admin  ← CHANGE IMMEDIATELY after first login.
 #
@@ -684,8 +810,9 @@ services:
     restart: unless-stopped
     environment:
       APP_URL: "https://arcane.YOURDOMAIN"
-      # Socket proxy connection — arcane never touches docker.sock directly
-      DOCKER_HOST: "tcp://socket-proxy:2375"
+      # Talks to the FULL-API socket proxy (POST/DELETE/EXEC/BUILD enabled).
+      # Public exposure is gated by the tailscale-only middleware on Traefik.
+      DOCKER_HOST: "tcp://socket-proxy-mgmt:2375"
       # Secrets generated at server setup time — do not regenerate
       ENCRYPTION_KEY: "${ARCANE_ENCRYPTION_KEY}"
       JWT_SECRET: "${ARCANE_JWT_SECRET}"
@@ -699,9 +826,9 @@ services:
       - ${MGMT_DIR}/arcane/stacks:${MGMT_DIR}/arcane/stacks
     networks:
       - traefik-public
-      - socket-proxy
-    # Internal port 3552 is available for SSH tunnel access (see above).
-    # Binds to 127.0.0.1 only — NOT publicly exposed.
+      - socket-proxy-mgmt
+    # Internal port 3552 — bound to 127.0.0.1 only (SSH tunnel fallback).
+    # NOT publicly exposed.
     ports:
       - "127.0.0.1:3552:3552"
     security_opt:
@@ -710,12 +837,16 @@ services:
       - "traefik.enable=true"
       - "traefik.http.routers.arcane.rule=Host(\`arcane.YOURDOMAIN\`)"
       - "traefik.http.routers.arcane.entrypoints=websecure"
+      # Tailscale-only gate — middleware defined in traefik/dynamic/middlewares.yml.
+      - "traefik.http.routers.arcane.middlewares=tailscale-only@file"
       - "traefik.http.services.arcane.loadbalancer.server.port=3552"
 
 networks:
   traefik-public:
+    name: traefik-public
     external: true
-  socket-proxy:
+  socket-proxy-mgmt:
+    name: socket-proxy-mgmt
     external: true
 EOF
 
@@ -765,7 +896,8 @@ networks:
 EOF
 
 chmod 644 "${MGMT_DIR}/socket-proxy/docker-compose.yml"
-chmod 600 "${MGMT_DIR}/traefik/docker-compose.yml"   # contains email + auth credentials
+chmod 644 "${MGMT_DIR}/traefik/docker-compose.yml"   # only contains placeholders / ACME email
+chmod 644 "${MGMT_DIR}/traefik/dynamic/middlewares.yml"
 chmod 600 "${MGMT_DIR}/arcane/docker-compose.yml"    # contains generated secrets
 chmod 644 "${MGMT_DIR}/traefik/example-app-stack.yml"
 
@@ -775,7 +907,7 @@ if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
   echo "[*] Ownership of ${MGMT_DIR} set to ${SUDO_USER}"
 fi
 
-echo "[*] Compose templates written to ${MGMT_DIR}/traefik/ and ${MGMT_DIR}/arcane/ and ${MGMT_DIR}/socket-proxy/"
+echo "[*] Compose templates written to ${MGMT_DIR}/{socket-proxy,traefik,arcane}/"
 
 ########################
 # UFW firewall
@@ -876,16 +1008,27 @@ if [ "${INSTALL_TAILSCALE}" = "yes" ]; then
 
   if [ -n "${TAILSCALE_AUTH_KEY}" ]; then
     echo "[*] Authenticating Tailscale with provided auth key..."
+    # Auth key passed via a temp file (--auth-key=file:...) so the secret never
+    # appears in 'ps' / process accounting / shell history. File is mode 0600
+    # and removed via trap regardless of how this section exits.
+    TS_KEYFILE="$(mktemp)"
+    chmod 600 "${TS_KEYFILE}"
+    printf '%s' "${TAILSCALE_AUTH_KEY}" > "${TS_KEYFILE}"
+    # shellcheck disable=SC2064  # intentionally expand TS_KEYFILE now
+    trap "rm -f '${TS_KEYFILE}'" EXIT
+
     # --timeout: abort rather than hang indefinitely if the control plane is unreachable.
-    # --accept-routes: honour subnet routes advertised by other nodes (harmless if unused).
-    # The auth key is passed via env var to avoid it appearing in 'ps' output.
-    TS_UP_ARGS="--authkey=${TAILSCALE_AUTH_KEY} --timeout=60s"
+    TS_UP_ARGS="--auth-key=file:${TS_KEYFILE} --timeout=60s"
     [ "${TAILSCALE_EXIT_NODE}" = "yes" ] && TS_UP_ARGS="${TS_UP_ARGS} --advertise-exit-node"
-    TS_AUTHKEY="${TAILSCALE_AUTH_KEY}" tailscale up ${TS_UP_ARGS}
+    # shellcheck disable=SC2086  # intentional word splitting on TS_UP_ARGS
+    tailscale up ${TS_UP_ARGS}
+
+    rm -f "${TS_KEYFILE}"
+    trap - EXIT
 
     # Wait up to 30 s for the node to receive a Tailscale IP.
     TS_IP=""
-    for i in $(seq 1 30); do
+    for _ in $(seq 1 30); do
       TS_IP="$(tailscale ip -4 2>/dev/null || true)"
       [ -n "${TS_IP}" ] && break
       sleep 1
@@ -1039,11 +1182,14 @@ SUMMARY:
   Docker CE     icc=true, no-new-privileges, ip=127.0.0.1, userland-proxy=false
   iptables      DOCKER-USER: HTTP(${ALLOW_HTTP})/HTTPS(${ALLOW_HTTPS}) public; else DROP
                 Persisted via systemd (docker-iptables-restore.service)
-  Networks      traefik-public, socket-proxy (pre-created)
-  Templates     ${MGMT_DIR}/socket-proxy/docker-compose.yml       ← start this first
-                ${MGMT_DIR}/traefik/docker-compose.yml      ← Traefik v3
-                ${MGMT_DIR}/arcane/docker-compose.yml       ← Arcane (secrets pre-generated)
-                ${MGMT_DIR}/traefik/example-app-stack.yml   ← app+db wiring example
+  Networks      Created on demand by compose:
+                  socket-proxy stack → socket-proxy-traefik, socket-proxy-mgmt
+                  traefik stack      → traefik-public (172.18.0.0/16, traefik @ .254)
+  Templates     ${MGMT_DIR}/socket-proxy/docker-compose.yml   ← start this first
+                ${MGMT_DIR}/traefik/docker-compose.yml        ← Traefik v3 (read-only sock)
+                ${MGMT_DIR}/traefik/dynamic/middlewares.yml   ← shared middlewares (file provider)
+                ${MGMT_DIR}/arcane/docker-compose.yml         ← Arcane (Tailscale-only)
+                ${MGMT_DIR}/traefik/example-app-stack.yml     ← app+db wiring example
   QEMU agent    Enabled (Hetzner clean shutdown + IP reporting)
   UFW           deny inbound; HTTP/HTTPS open; SSH rate-limited (6/30s); logging=medium
   Fail2Ban      SSH via systemd backend; maxretry=3, bantime=1h
@@ -1083,28 +1229,43 @@ else
   echo "  ssh <user>@${SERVER_IP} -p ${SSH_PORT}"
 fi)
 
-ARCANE ACCESS (no public port — use SSH tunnel):
-  ssh -L 3552:localhost:3552 <user>@${SERVER_IP}
-  Open: http://localhost:3552
-  Default login: arcane / arcane-admin  ← change on first login
+ARCANE ACCESS (Tailscale-only via Traefik):
+  Router carries tailscale-only@file middleware (sourceRange 100.64.0.0/10 +
+  fd7a:115c:a1e0::/48). Public clients receive HTTP 403.
+    arcane: https://arcane.YOURDOMAIN  (default login arcane / arcane-admin)
+
+  Fallback (no DNS yet): SSH tunnel
+    ssh -L 3552:localhost:3552 <user>@${SERVER_IP}
+    Open: http://localhost:3552
+
+  Code Server / further internal tools: deploy as additional stacks via Arcane.
+  Apply Tailscale gate by adding this label to any router:
+    - "traefik.http.routers.<name>.middlewares=tailscale-only@file"
 
 DEPLOY ORDER:
-  1. Edit ${MGMT_DIR}/socket-proxy/docker-compose.yml
-     cd ${MGMT_DIR}/socket-proxy && docker compose up -d
+  1. cd ${MGMT_DIR}/socket-proxy && docker compose up -d
+     (creates networks: socket-proxy-traefik, socket-proxy-mgmt)
 
-  2. Edit ${MGMT_DIR}/traefik/docker-compose.yml   — set TRAEFIK_ACME_EMAIL, YOURDOMAIN,
-                                                     generate dashboard basicauth hash
+  2. Edit ${MGMT_DIR}/traefik/docker-compose.yml — set TRAEFIK_ACME_EMAIL + YOURDOMAIN
      cd ${MGMT_DIR}/traefik && docker compose up -d
+     (creates network: traefik-public; loads dynamic config from /dynamic)
 
-  3. Edit ${MGMT_DIR}/arcane/docker-compose.yml  — set YOURDOMAIN in APP_URL and Traefik label
+  3. Edit ${MGMT_DIR}/arcane/docker-compose.yml — set YOURDOMAIN
      cd ${MGMT_DIR}/arcane && docker compose up -d
 
   4. For each app stack: attach app to traefik-public + a private backend network;
      attach db ONLY to the private backend network. See example-app-stack.yml.
 
+ADDING SHARED MIDDLEWARES:
+  Edit ${MGMT_DIR}/traefik/dynamic/middlewares.yml — Traefik watches the file
+  and reloads automatically (no restart needed). Reference from any router as
+  <name>@file in compose labels.
+
 KEY RULES:
   • Traefik ports MUST be "0.0.0.0:80:80" / "0.0.0.0:443:443" (daemon defaults to 127.0.0.1)
-  • Never mount /var/run/docker.sock into Traefik or Arcane directly — only into socket-proxy
+  • Never mount /var/run/docker.sock anywhere except into socket-proxy-* / autoheal
+  • Traefik talks to socket-proxy-traefik (read-only API only — no POST/EXEC/BUILD)
+  • Arcane talks to socket-proxy-mgmt (full API) but is Tailscale-gated at Traefik
   • DB containers: backend network only — never traefik-public, never a published port
   • Network isolation is enforced by attaching each container only to the networks it needs
 
