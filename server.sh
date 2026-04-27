@@ -11,7 +11,9 @@
 #   INSTALL_TAILSCALE    yes|no (default no)
 #                        Installs and enables tailscaled.
 #   TAILSCALE_AUTH_KEY   (optional) Tailscale auth key — if set, the node is authenticated
-#                        automatically during the script via 'tailscale up --authkey=...'.
+#                        automatically during the script via 'tailscale up --auth-key=file:...'
+#                        (the key is written to a 0600 tempfile and removed via trap, so it
+#                        never appears in `ps` output or shell history).
 #                        Generate one at https://login.tailscale.com/admin/settings/keys
 #                        Reusable / ephemeral keys both work; prefer ephemeral for servers.
 #                        If unset, run 'tailscale up' manually after the script completes.
@@ -43,23 +45,43 @@
 #   Docker bypasses UFW by manipulating iptables directly. Mitigated by:
 #   - "ip": "127.0.0.1" in daemon.json (localhost-only default binding)
 #   - DOCKER-USER iptables chain rules (persisted via systemd, see below)
+#
+# WARNING: this script is destructive on re-run.
+#   - `ufw --force reset` wipes ALL UFW rules (including any added manually).
+#   - The DOCKER-USER chain is flushed and rebuilt from /usr/local/sbin/apply-docker-user-rules.sh.
+#   - daemon.json, sshd drop-in, sysctl drop-ins, unattended-upgrades config are all overwritten.
+#   Edit the apply-docker-user-rules.sh script directly if you need permanent custom rules.
 
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
 ########################
+# Helpers
+########################
+
+info() { printf '[*] %s\n' "$*"; }
+warn() { printf '[!] %s\n' "$*" >&2; }
+die()  { printf '[X] %s\n' "$*" >&2; exit 1; }
+
+# Validate that a yes|no env var has one of the two accepted values.
+# Catches typos like "true"/"1"/"YES" that would otherwise be silently treated as no.
+require_yesno() {
+  local name=$1 val=$2
+  case "$val" in
+    yes|no) ;;
+    *) die "$name must be 'yes' or 'no', got '$val'" ;;
+  esac
+}
+
+########################
 # Preconditions
 ########################
 
-if [ "$(id -u)" -ne 0 ]; then
-  echo "Please run this script as root (sudo)." >&2
-  exit 1
-fi
+[ "$(id -u)" -eq 0 ] || die "Please run this script as root (sudo)."
 
-if ! grep -qi "debian" /etc/os-release; then
-  echo "This script is intended for Debian only." >&2
-  exit 1
-fi
+# Strict Debian check — Ubuntu has ID_LIKE=debian which would slip past a loose grep.
+. /etc/os-release 2>/dev/null || die "/etc/os-release missing — unsupported OS."
+[ "${ID:-}" = "debian" ] || die "This script supports Debian only (got ID=${ID:-unknown})."
 
 ALLOW_HTTP="${ALLOW_HTTP:-yes}"
 ALLOW_HTTPS="${ALLOW_HTTPS:-yes}"
@@ -69,21 +91,24 @@ TAILSCALE_AUTH_KEY="${TAILSCALE_AUTH_KEY:-}"
 SSH_VIA_TAILSCALE="${SSH_VIA_TAILSCALE:-no}"
 TAILSCALE_EXIT_NODE="${TAILSCALE_EXIT_NODE:-no}"
 
-if [ "${SSH_VIA_TAILSCALE}" = "yes" ] && [ "${INSTALL_TAILSCALE}" != "yes" ]; then
-  echo "ERROR: SSH_VIA_TAILSCALE=yes requires INSTALL_TAILSCALE=yes" >&2
-  exit 1
-fi
+require_yesno ALLOW_HTTP          "${ALLOW_HTTP}"
+require_yesno ALLOW_HTTPS         "${ALLOW_HTTPS}"
+require_yesno INSTALL_TAILSCALE   "${INSTALL_TAILSCALE}"
+require_yesno SSH_VIA_TAILSCALE   "${SSH_VIA_TAILSCALE}"
+require_yesno TAILSCALE_EXIT_NODE "${TAILSCALE_EXIT_NODE}"
 
-if [ "${TAILSCALE_EXIT_NODE}" = "yes" ] && [ "${INSTALL_TAILSCALE}" != "yes" ]; then
-  echo "ERROR: TAILSCALE_EXIT_NODE=yes requires INSTALL_TAILSCALE=yes" >&2
-  exit 1
-fi
+# Tailscale-dependent options require the Tailscale install
+for v in SSH_VIA_TAILSCALE TAILSCALE_EXIT_NODE; do
+  if [ "${!v}" = "yes" ] && [ "${INSTALL_TAILSCALE}" != "yes" ]; then
+    die "$v=yes requires INSTALL_TAILSCALE=yes"
+  fi
+done
 
 if [ "${SSH_VIA_TAILSCALE}" = "yes" ] && [ -z "${TAILSCALE_AUTH_KEY}" ]; then
-  echo "WARNING: SSH_VIA_TAILSCALE=yes but TAILSCALE_AUTH_KEY is not set." >&2
-  echo "         The node will NOT join the tailnet automatically. Public SSH will be" >&2
-  echo "         blocked and the Hetzner VNC console will be your only access until" >&2
-  echo "         you run 'tailscale up' manually. Continuing in 10 seconds..." >&2
+  warn "SSH_VIA_TAILSCALE=yes but TAILSCALE_AUTH_KEY is not set."
+  warn "  The node will NOT join the tailnet automatically. Public SSH will be"
+  warn "  blocked and the Hetzner VNC console will be your only access until"
+  warn "  you run 'tailscale up' manually. Continuing in 10 seconds..."
   sleep 10
 fi
 
@@ -95,7 +120,7 @@ MGMT_DIR="${REAL_HOME}/management"
 # System update
 ########################
 
-echo "[*] Updating system packages..."
+info "Updating system packages..."
 apt-get update -y
 apt-get upgrade -y
 
@@ -103,16 +128,18 @@ apt-get upgrade -y
 # Install base tools
 ########################
 
-echo "[*] Installing base utilities..."
+info "Installing base utilities..."
+# apt-transport-https is intentionally NOT here — apt has native HTTPS support since
+# Debian 10. Including it pulls in stale certificates and is a remnant from old guides.
 apt-get install -y \
   ca-certificates \
   curl \
   gnupg \
   lsb-release \
+  openssl \
   ufw \
   fail2ban \
   jq \
-  apt-transport-https \
   htop \
   qemu-guest-agent \
   nano
@@ -125,7 +152,7 @@ apt-get install -y \
 # Block iptables-persistent (apt pinning)
 ########################
 
-echo "[*] Blocking iptables-persistent via apt pinning..."
+info "Blocking iptables-persistent via apt pinning..."
 
 # iptables-persistent snapshots the ENTIRE iptables state (including dynamic Docker
 # chains, UFW rules, Tailscale chains) and replays them on every boot. Docker then
@@ -145,7 +172,7 @@ EOF
 # QEMU Guest Agent
 ########################
 
-echo "[*] Enabling QEMU Guest Agent..."
+info "Enabling QEMU Guest Agent..."
 systemctl enable qemu-guest-agent
 systemctl start qemu-guest-agent
 
@@ -165,7 +192,7 @@ modprobe br_netfilter
 # Kernel / sysctl hardening
 ########################
 
-echo "[*] Applying kernel sysctl hardening..."
+info "Applying kernel sysctl hardening..."
 
 cat >/etc/sysctl.d/99-hardening.conf <<'EOF'
 # TCP SYN flood protection
@@ -229,7 +256,7 @@ sysctl --system
 
 # Exit node requires IP forwarding (Docker already benefits from ipv4, but ipv6 is not set above).
 if [ "${TAILSCALE_EXIT_NODE}" = "yes" ]; then
-  echo "[*] Enabling IP forwarding for Tailscale exit node..."
+  info "Enabling IP forwarding for Tailscale exit node..."
   cat >/etc/sysctl.d/99-tailscale-exit-node.conf <<'EOF'
 # Required for Tailscale exit node functionality
 net.ipv4.ip_forward = 1
@@ -249,16 +276,18 @@ EOF
   # drops significantly without this. See https://tailscale.com/s/ethtool-config-udp-gro
   MAIN_IF="$(ip -o -4 route show default | awk '{print $5; exit}')"
   if [ -n "${MAIN_IF}" ]; then
-    echo "[*] Configuring UDP GRO forwarding on ${MAIN_IF} for Tailscale exit node..."
+    info "Configuring UDP GRO forwarding on ${MAIN_IF} for Tailscale exit node..."
     apt-get install -y ethtool
     ethtool -K "${MAIN_IF}" rx-udp-gro-forwarding on rx-gro-list off 2>/dev/null || \
-      echo "WARNING: ethtool GRO config failed on ${MAIN_IF} — may not be supported by this NIC driver" >&2
+      warn "ethtool GRO config failed on ${MAIN_IF} — may not be supported by this NIC driver"
 
-    # Persist via a systemd service — ethtool settings reset on reboot
-    cat >/etc/systemd/system/tailscale-gro.service <<EOF2
+    # Persist via a systemd service — ethtool settings reset on reboot.
+    # network-online.target ensures the interface is up before ethtool runs.
+    cat >/etc/systemd/system/tailscale-gro.service <<EOF
 [Unit]
 Description=Tailscale exit node UDP GRO forwarding
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot
@@ -267,53 +296,57 @@ ExecStart=/sbin/ethtool -K ${MAIN_IF} rx-udp-gro-forwarding on rx-gro-list off
 
 [Install]
 WantedBy=multi-user.target
-EOF2
+EOF
     systemctl daemon-reload
     systemctl enable tailscale-gro.service
-    echo "[*] tailscale-gro.service enabled (persists GRO config across reboots)"
+    info "tailscale-gro.service enabled (persists GRO config across reboots)"
   fi
+else
+  # Re-run with EXIT_NODE=no after a previous run with =yes: clean up the leftover
+  # service + sysctl drop-in so the system actually reverts to non-exit-node state.
+  if [ -e /etc/systemd/system/tailscale-gro.service ]; then
+    info "Removing stale tailscale-gro.service from previous exit-node run..."
+    systemctl disable --now tailscale-gro.service 2>/dev/null || true
+    rm -f /etc/systemd/system/tailscale-gro.service
+    systemctl daemon-reload
+  fi
+  rm -f /etc/sysctl.d/99-tailscale-exit-node.conf
 fi
 
 ########################
 # Install Docker CE (Debian repo)
 ########################
 
-echo "[*] Setting up Docker repository (Debian Trixie)..."
+info "Setting up Docker repository (Debian Trixie)..."
 
 install -m 0755 -d /etc/apt/keyrings
 
 # Download GPG key and verify fingerprint before trusting it.
 # Fingerprint source: https://docs.docker.com/engine/install/debian/
 DOCKER_GPG_TMP="$(mktemp)"
+trap 'rm -f "${DOCKER_GPG_TMP}"' EXIT
 curl -fsSL https://download.docker.com/linux/debian/gpg -o "${DOCKER_GPG_TMP}"
 
-DOCKER_KEYRING_TMP="$(mktemp --suffix=.gpg)"
-gpg --no-default-keyring --keyring "${DOCKER_KEYRING_TMP}" \
-    --import "${DOCKER_GPG_TMP}" 2>/dev/null
-
 DOCKER_GPG_EXPECTED="9DC858229FC7DD38854AE2D88D81803C0EBFCD88"
-# Use --with-colons for structured output: the 'fpr' record contains the fingerprint
+# `gpg --show-keys` parses the key file directly without importing into a keyring.
+# --with-colons gives machine-parseable output; the 'fpr' record holds the fingerprint
 # in field 10. 'exit' after the first match ensures we get the PRIMARY key only,
 # not a subkey (which caused false mismatches with grep-based extraction).
-DOCKER_GPG_ACTUAL=$(gpg --no-default-keyring --keyring "${DOCKER_KEYRING_TMP}" \
-    --with-colons --fingerprint 2>/dev/null \
+DOCKER_GPG_ACTUAL=$(gpg --show-keys --with-colons "${DOCKER_GPG_TMP}" 2>/dev/null \
     | awk -F: '/^fpr:/{print $10; exit}')
 
-rm -f "${DOCKER_KEYRING_TMP}"
-
 if [ "${DOCKER_GPG_ACTUAL}" != "${DOCKER_GPG_EXPECTED}" ]; then
-  echo "Docker GPG key fingerprint mismatch!" >&2
-  echo "  Expected: ${DOCKER_GPG_EXPECTED}" >&2
-  echo "  Got:      ${DOCKER_GPG_ACTUAL}" >&2
-  echo "Aborting — do NOT trust this key." >&2
-  rm -f "${DOCKER_GPG_TMP}"
-  exit 1
+  warn "Docker GPG key fingerprint mismatch!"
+  warn "  Expected: ${DOCKER_GPG_EXPECTED}"
+  warn "  Got:      ${DOCKER_GPG_ACTUAL}"
+  die  "Aborting — do NOT trust this key."
 fi
 
-echo "[*] Docker GPG key fingerprint verified."
+info "Docker GPG key fingerprint verified."
 gpg --dearmor < "${DOCKER_GPG_TMP}" > /etc/apt/keyrings/docker.gpg
 chmod a+r /etc/apt/keyrings/docker.gpg
 rm -f "${DOCKER_GPG_TMP}"
+trap - EXIT
 
 CODENAME="$(lsb_release -cs)"
 
@@ -321,7 +354,7 @@ cat >/etc/apt/sources.list.d/docker.list <<EOF
 deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian ${CODENAME} stable
 EOF
 
-echo "[*] Installing Docker Engine..."
+info "Installing Docker Engine..."
 apt-get update -y
 apt-get install -y \
   docker-ce \
@@ -339,14 +372,14 @@ systemctl start containerd
 # This takes effect on next login; 'newgrp docker' activates it in the current session.
 if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
   usermod -aG docker "${SUDO_USER}"
-  echo "[*] Added ${SUDO_USER} to docker group (re-login or run: newgrp docker)"
+  info "Added ${SUDO_USER} to docker group (re-login or run: newgrp docker)"
 fi
 
 ########################
 # Docker daemon hardening
 ########################
 
-echo "[*] Configuring Docker daemon hardening..."
+info "Configuring Docker daemon hardening..."
 
 mkdir -p /etc/docker
 
@@ -420,7 +453,7 @@ systemctl restart docker
 # Docker / UFW iptables hardening (DOCKER-USER chain)
 ########################
 
-echo "[*] Hardening Docker iptables via DOCKER-USER chain..."
+info "Hardening Docker iptables via DOCKER-USER chain..."
 
 # Persist as a standalone script — only DOCKER-USER chain, never all chains.
 # Earlier approach (iptables-save/restore) snapshotted UFW + Tailscale + Docker
@@ -438,11 +471,19 @@ cat >/usr/local/sbin/apply-docker-user-rules.sh <<'RULES_EOF'
 #!/bin/bash
 set -euo pipefail
 
-# Wait for DOCKER-USER chain to exist (Docker creates it on startup)
-for i in {1..30}; do
+# Wait for DOCKER-USER chain to exist (Docker creates it on startup).
+# Fail loudly if it never appears — without this, the script would silently
+# continue, every iptables call below would fail, and the systemd unit might
+# still report success on the (unrelated) final command.
+for _ in {1..30}; do
   iptables -L DOCKER-USER -n >/dev/null 2>&1 && break
   sleep 1
 done
+if ! iptables -L DOCKER-USER -n >/dev/null 2>&1; then
+  logger -t docker-user-rules "DOCKER-USER chain not present after 30s — dockerd may not have started"
+  echo "DOCKER-USER chain missing after 30s — aborting" >&2
+  exit 1
+fi
 
 iptables -F DOCKER-USER
 
@@ -504,7 +545,7 @@ systemctl enable docker-iptables-restore.service
 # Restart socket-proxies after Docker daemon restarts
 ########################
 
-echo "[*] Configuring socket-proxy auto-restart after Docker daemon restarts..."
+info "Configuring socket-proxy auto-restart after Docker daemon restarts..."
 
 # When the Docker daemon restarts (e.g. after an unattended-upgrade of docker-ce),
 # /var/run/docker.sock is recreated with a new inode. The socket-proxy bind mount
@@ -517,8 +558,9 @@ echo "[*] Configuring socket-proxy auto-restart after Docker daemon restarts..."
 # `docker compose up` has ever run) neither container exists, and we don't want
 # docker.service to be marked failed for that. The autoheal container provides a
 # secondary safety net via healthchecks.
-
-mkdir -p /etc/systemd/system/docker.service.d
+#
+# /etc/systemd/system/docker.service.d already exists from the bridge-netfilter drop-in
+# above, so no mkdir needed here.
 
 cat >/etc/systemd/system/docker.service.d/restart-socket-proxy.conf <<'EOF'
 [Service]
@@ -534,7 +576,7 @@ systemctl daemon-reload
 # Docker socket proxy + Traefik + Arcane compose files
 ########################
 
-echo "[*] Writing Traefik / Arcane compose templates..."
+info "Writing Traefik / Arcane compose templates..."
 
 # WHY A SOCKET PROXY?
 # Mounting /var/run/docker.sock into a container gives that container unrestricted
@@ -761,17 +803,16 @@ EOF
 
 # Arcane requires two secrets (ENCRYPTION_KEY and JWT_SECRET) that must be
 # stable across restarts — regenerating them invalidates all sessions and
-# encrypted data. We generate them now and bake them into the compose file
-# so they are ready to use without any manual steps.
-echo "[*] Generating Arcane secrets..."
-ARCANE_SECRETS_RAW="$(docker run --rm ghcr.io/getarcaneapp/arcane:latest /app/arcane generate secret 2>/dev/null)"
-ARCANE_ENCRYPTION_KEY="$(echo "${ARCANE_SECRETS_RAW}" | awk -F'=' '/ENCRYPTION_KEY/{print $2}' | tr -d '[:space:]')"
-ARCANE_JWT_SECRET="$(echo "${ARCANE_SECRETS_RAW}" | awk -F'=' '/JWT_SECRET/{print $2}' | tr -d '[:space:]')"
+# encrypted data. We generate them locally with openssl (no need to pull the
+# Arcane image just for two random values).
+#   ENCRYPTION_KEY → 32 hex chars (16 bytes), per Arcane docs
+#   JWT_SECRET     → long random string (64 hex chars / 32 bytes is plenty)
+info "Generating Arcane secrets..."
+ARCANE_ENCRYPTION_KEY="$(openssl rand -hex 16)"
+ARCANE_JWT_SECRET="$(openssl rand -hex 32)"
 
-if [ -z "${ARCANE_ENCRYPTION_KEY}" ] || [ -z "${ARCANE_JWT_SECRET}" ]; then
-  echo "ERROR: Failed to generate Arcane secrets. Is Docker running?" >&2
-  exit 1
-fi
+[ -n "${ARCANE_ENCRYPTION_KEY}" ] && [ -n "${ARCANE_JWT_SECRET}" ] || \
+  die "Failed to generate Arcane secrets — openssl rand returned empty."
 
 mkdir -p "${MGMT_DIR}/arcane/stacks"
 
@@ -904,16 +945,16 @@ chmod 644 "${MGMT_DIR}/traefik/example-app-stack.yml"
 # Fix ownership — script runs as root but files should belong to the invoking user
 if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != "root" ]; then
   chown -R "${SUDO_USER}:$(id -gn "${SUDO_USER}")" "${MGMT_DIR}"
-  echo "[*] Ownership of ${MGMT_DIR} set to ${SUDO_USER}"
+  info "Ownership of ${MGMT_DIR} set to ${SUDO_USER}"
 fi
 
-echo "[*] Compose templates written to ${MGMT_DIR}/{socket-proxy,traefik,arcane}/"
+info "Compose templates written to ${MGMT_DIR}/{socket-proxy,traefik,arcane}/"
 
 ########################
 # UFW firewall
 ########################
 
-echo "[*] Configuring UFW firewall..."
+info "Configuring UFW firewall..."
 
 ufw --force reset
 
@@ -927,7 +968,7 @@ ufw default allow outgoing
 # Docker container isolation is enforced by the DOCKER-USER iptables chain instead.
 sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
 if ! grep -q 'DEFAULT_FORWARD_POLICY="ACCEPT"' /etc/default/ufw; then
-  echo "WARNING: UFW forward policy was not updated — check /etc/default/ufw manually" >&2
+  warn "UFW forward policy was not updated — check /etc/default/ufw manually"
 fi
 
 if [ "${ALLOW_HTTP}" = "yes" ]; then
@@ -947,7 +988,7 @@ if [ "${SSH_VIA_TAILSCALE}" = "yes" ]; then
   ufw allow in on tailscale0 to any port "${SSH_PORT}" proto tcp comment "SSH via Tailscale only"
   # Allow Tailscale's WireGuard UDP port so the node can join the tailnet.
   ufw allow 41641/udp comment "Tailscale WireGuard"
-  echo "[!] SSH_VIA_TAILSCALE=yes — public SSH is BLOCKED."
+  warn "SSH_VIA_TAILSCALE=yes — public SSH is BLOCKED."
   echo "    Run 'tailscale up' to join your tailnet, then verify SSH access before"
   echo "    closing this session or you will be locked out."
 else
@@ -968,7 +1009,7 @@ echo "y" | ufw enable
 # Fail2Ban for SSH
 ########################
 
-echo "[*] Configuring Fail2Ban for SSH..."
+info "Configuring Fail2Ban for SSH..."
 
 mkdir -p /etc/fail2ban/jail.d
 
@@ -991,7 +1032,7 @@ systemctl restart fail2ban
 ########################
 
 if [ "${INSTALL_TAILSCALE}" = "yes" ]; then
-  echo "[*] Installing Tailscale..."
+  info "Installing Tailscale..."
 
   # Use the official Tailscale apt repository for Debian Trixie.
   # The .noarmor.gpg key is the raw binary keyring format required by apt.
@@ -1007,7 +1048,7 @@ if [ "${INSTALL_TAILSCALE}" = "yes" ]; then
   systemctl start tailscaled
 
   if [ -n "${TAILSCALE_AUTH_KEY}" ]; then
-    echo "[*] Authenticating Tailscale with provided auth key..."
+    info "Authenticating Tailscale with provided auth key..."
     # Auth key passed via a temp file (--auth-key=file:...) so the secret never
     # appears in 'ps' / process accounting / shell history. File is mode 0600
     # and removed via trap regardless of how this section exits.
@@ -1028,20 +1069,20 @@ if [ "${INSTALL_TAILSCALE}" = "yes" ]; then
 
     # Wait up to 30 s for the node to receive a Tailscale IP.
     TS_IP=""
-    for _ in $(seq 1 30); do
+    for _ in {1..30}; do
       TS_IP="$(tailscale ip -4 2>/dev/null || true)"
       [ -n "${TS_IP}" ] && break
       sleep 1
     done
 
     if [ -n "${TS_IP}" ]; then
-      echo "[*] Tailscale authenticated. Tailscale IP: ${TS_IP}"
+      info "Tailscale authenticated. Tailscale IP: ${TS_IP}"
     else
-      echo "WARNING: Tailscale authenticated but could not retrieve IP within 30 s." >&2
-      echo "         Run 'tailscale ip -4' once the node has fully connected." >&2
+      warn "Tailscale authenticated but could not retrieve IP within 30 s."
+      warn "  Run 'tailscale ip -4' once the node has fully connected."
     fi
   else
-    echo "[*] tailscaled installed and running."
+    info "tailscaled installed and running."
     echo "    No auth key provided — run the following to join your tailnet:"
     if [ "${TAILSCALE_EXIT_NODE}" = "yes" ]; then
       echo "      tailscale up --advertise-exit-node"
@@ -1056,7 +1097,7 @@ fi
 # SSH hardening (drop-in config)
 ########################
 
-echo "[*] Hardening SSH via sshd_config.d drop-in..."
+info "Hardening SSH via sshd_config.d drop-in..."
 
 # Write all hardening settings to a drop-in file rather than patching sshd_config with sed.
 # - sshd_config and other drop-ins are left untouched (easier auditing/upgrades)
@@ -1096,10 +1137,7 @@ PrintMotd no
 EOF
 
 # Validate config syntax before reloading — avoids locking yourself out
-sshd -t || {
-  echo "sshd config test FAILED — check ${SSHD_DROPIN}" >&2
-  exit 1
-}
+sshd -t || die "sshd config test FAILED — check ${SSHD_DROPIN}"
 
 systemctl reload ssh || systemctl restart ssh
 
@@ -1107,7 +1145,7 @@ systemctl reload ssh || systemctl restart ssh
 # Unattended upgrades (non-interactive)
 ########################
 
-echo "[*] Enabling unattended security upgrades..."
+info "Enabling unattended security upgrades..."
 apt-get install -y unattended-upgrades
 
 # Write explicit config instead of relying on Debian defaults.
@@ -1166,6 +1204,53 @@ EOF
 unattended-upgrade --dry-run 2>&1 | grep -E "Packages|No packages|ERROR" || true
 
 ########################
+# Final verification
+########################
+
+info "Running post-install verification..."
+
+# Smoke-test the most important pieces of the install. Each check runs `warn`
+# on failure but does NOT abort — the user gets a single, visible list of
+# findings so they can decide what to do. We don't `die` here because partial
+# success (e.g. SSH OK but UFW reports inactive in a transient state) is more
+# useful than nuking the whole bootstrap with a single failed check.
+VERIFY_FAIL=0
+verify() {
+  local desc=$1; shift
+  if "$@" >/dev/null 2>&1; then
+    printf '    ✓ %s\n' "${desc}"
+  else
+    printf '    ✗ %s\n' "${desc}" >&2
+    VERIFY_FAIL=$((VERIFY_FAIL + 1))
+  fi
+}
+
+verify "docker.service active"             systemctl is-active --quiet docker
+verify "containerd.service active"         systemctl is-active --quiet containerd
+verify "fail2ban active"                   systemctl is-active --quiet fail2ban
+verify "ufw active"                        bash -c 'ufw status | grep -q "Status: active"'
+verify "DOCKER-USER chain present"         iptables -L DOCKER-USER -n
+verify "DOCKER-USER ends with DROP"        bash -c 'iptables -S DOCKER-USER | tail -1 | grep -q -- "-j DROP"'
+verify "sshd config valid"                 sshd -t
+verify "sshd listening on port ${SSH_PORT}" bash -c "ss -tln | awk '{print \$4}' | grep -qE ':${SSH_PORT}\$'"
+verify "br_netfilter loaded"               bash -c 'lsmod | grep -q "^br_netfilter"'
+verify "docker-iptables-restore.service enabled" systemctl is-enabled --quiet docker-iptables-restore.service
+
+if [ "${INSTALL_TAILSCALE}" = "yes" ]; then
+  verify "tailscaled active"               systemctl is-active --quiet tailscaled
+fi
+if [ "${TAILSCALE_EXIT_NODE}" = "yes" ]; then
+  verify "tailscale-gro.service enabled"   systemctl is-enabled --quiet tailscale-gro.service
+  verify "ip_forward enabled"              bash -c '[ "$(cat /proc/sys/net/ipv4/ip_forward)" = "1" ]'
+fi
+
+if [ "${VERIFY_FAIL}" -gt 0 ]; then
+  warn "${VERIFY_FAIL} verification check(s) failed — review the ✗ entries above before relying on this server."
+else
+  info "All verification checks passed."
+fi
+
+########################
 # Info / next steps
 ########################
 
@@ -1180,7 +1265,8 @@ SUMMARY:
   System        Updated with DEBIAN_FRONTEND=noninteractive
   sysctl        /etc/sysctl.d/99-hardening.conf (SYN cookies, rp_filter, redirect blocks, etc.)
   Docker CE     icc=true, no-new-privileges, ip=127.0.0.1, userland-proxy=false
-  iptables      DOCKER-USER: HTTP(${ALLOW_HTTP})/HTTPS(${ALLOW_HTTPS}) public; else DROP
+  iptables      DOCKER-USER: lo + ESTABLISHED + 100.64/10 + 172.16/12 + 80/443 RETURN; else DROP
+                ALLOW_HTTP/ALLOW_HTTPS gate UFW only — edit the persisted script to change.
                 Persisted via systemd (docker-iptables-restore.service)
   Networks      Created on demand by compose:
                   socket-proxy stack → socket-proxy-traefik, socket-proxy-mgmt
